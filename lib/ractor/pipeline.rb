@@ -68,6 +68,18 @@ class Ractor
   module Pipeline
     class Error < StandardError; end
 
+    # Raised in a stage block to drop the current element:
+    #
+    #   pipe{ Integer(it) rescue raise(SKIP) }
+    #   pipe{ raise SKIP if broken?(it); fix(it) }
+    #
+    # SKIP is for exceptional cases (systematic thinning is what
+    # filter_pipe is for), so it is priced accordingly: the happy path
+    # costs nothing and each skip costs one exception (~0.5us). It
+    # inherits Exception, not StandardError, so a bare `rescue => e` in
+    # the block cannot swallow it by accident.
+    class SKIP < Exception; end
+
     CREDIT = 2 # ready tokens per (producer, consumer) pair on pull links
 
     STOP = Object.new # throw tag for early termination (caller Ractor only)
@@ -400,13 +412,27 @@ class Ractor
             begin
               case kind
               when :pipe
-                dispatch.call(m[1].map { |obj| job.call(obj) })
+                out = []
+                m[1].each do |obj|
+                  out << job.call(obj)
+                rescue SKIP
+                end
+                dispatch.call(out) unless out.empty?
               when :filter_pipe
-                out = m[1].select { |obj| job.call(obj) }
+                out = m[1].select do |obj|
+                  begin
+                    job.call(obj)
+                  rescue SKIP
+                    false
+                  end
+                end
                 dispatch.call(out) unless out.empty?
               when :flat_pipe
                 out = []
-                m[1].each { |obj| job.call(obj).each { |o| out << o } }
+                m[1].each do |obj|
+                  job.call(obj).each { |o| out << o }
+                rescue SKIP
+                end
                 out.each_slice(batch_size) { |slice| dispatch.call(slice) }
               end
             rescue Ractor::ClosedError

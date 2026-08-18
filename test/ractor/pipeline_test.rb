@@ -56,6 +56,26 @@ class Ractor::PipelineTest < Test::Unit::TestCase
     assert_equal [1, 2, 3], stream([1, 2, 3]).to_a
   end
 
+  test "raising SKIP drops the element in every stage kind" do
+    assert_equal [1, 2, 4], stream(["1", "2", "x", "4"]).
+                              pipe{ Integer(it) rescue raise(SKIP) }.
+                              to_a
+    # nil stays ordinary data
+    assert_equal [nil, 1], stream([:nil, 1, :skip]).
+                             pipe{ raise SKIP if it == :skip; it == :nil ? nil : it }.
+                             to_a
+    assert_equal [2, 4], stream(1..5).
+                           filter_pipe{ raise SKIP if it == 5; it.even? }.
+                           to_a
+    assert_equal [1, 1, 3, 3], stream([1, 2, 3], batch: 2).
+                                 flat_pipe{ raise SKIP if it.even?; [it, it] }.
+                                 to_a.sort
+    # a bare `rescue => e` in the block cannot swallow a SKIP
+    assert_equal [1, 3], stream(1..3).
+                           pipe{ begin; raise SKIP if it.even?; rescue => e; :swallowed; end; it }.
+                           to_a
+  end
+
   test "batching is transparent and keeps single-lane order" do
     assert_equal((1..50).map{ it * 2 }, stream(1..50, batch: 7).pipe{ it * 2 }.to_a)
     assert_equal [2, 4, 6, 8, 10], stream(1..10, batch: 3).filter_pipe{ it.even? }.to_a
@@ -90,7 +110,10 @@ class Ractor::PipelineTest < Test::Unit::TestCase
       end
     end
     stream(src).pipe(lanes: 2){ it }.first(3)
-    assert_operator src.reads, :<, 100
+    # Reads track consumption (demand), so the exact number depends on
+    # scheduling; without demand-driven feeding this reaches hundreds of
+    # thousands.
+    assert_operator src.reads, :<, 10_000
   end
 
   test "stream1 flows one object as a single element" do

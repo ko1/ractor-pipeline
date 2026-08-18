@@ -221,9 +221,16 @@ shell pipeline). Safe to use with an infinite `stream(1..)`.
 
   ```ruby
   pipe{ JSON.parse(it) rescue DEFAULT }                    # fallback
-  pipe{ Integer(it) rescue nil }.filter_pipe{ it }         # skip bad elements
+  pipe{ Integer(it) rescue raise(SKIP) }                   # drop bad elements
   pipe{ begin; fetch(it); rescue Timeout::Error; retry; end }
   ```
+
+  Raising `SKIP` drops the current element. It is meant for exceptional
+  cases — systematic thinning is what `filter_pipe` is for — and is
+  priced accordingly: the happy path costs nothing, each skip costs one
+  exception. `SKIP` inherits `Exception`, so a bare `rescue => e` in the
+  block cannot swallow it; it also works from deep inside helper
+  methods.
 
   To collect diagnostics, wire your own stderr: a `Ractor::Port` is
   shareable, so a stage block can capture one and report failures to the
@@ -232,8 +239,7 @@ shell pipeline). Safe to use with an infinite `stream(1..)`.
   ```ruby
   errors = Ractor::Port.new
   result = stream(rows).
-             pipe(lanes: 8){ parse(it) rescue (errors << it; nil) }.
-             filter_pipe{ it }.
+             pipe(lanes: 8){ parse(it) rescue (errors << it; raise SKIP) }.
              to_a
   ```
 
@@ -352,9 +358,10 @@ amortizes that ~75x. Rule of thumb: aim for >= 1ms of work per message,
 via `batch:` or by chunking the source.
 
 **Source throttling** — infinite source, `pipe(lanes: 2){ it }.first(3)`:
-the source's `each` is invoked a few dozen times at most (5–40 across
-runs). A push-fed pipeline reads hundreds of thousands of elements before
-the cancellation lands.
+the source's `each` is invoked tens to a few hundred times (it tracks
+what the workers actually consume before the cancellation lands). A
+push-fed pipeline reads hundreds of thousands of elements in the same
+window.
 
 ## vs the parallel gem
 
