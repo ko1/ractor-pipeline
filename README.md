@@ -14,7 +14,7 @@ see in the code is the Ractor graph that runs.
 require "ractor/pipeline"
 include Ractor::Pipeline
 
-# conceptually: grep foo FILE | wc
+# conceptually: cat FILE | grep foo | wc
 stream(File.foreach(name))
   .filter_pipe(lanes: 4){ it.include?("foo") }
   .reduce([0, 0, 0]) do |(lines, words, bytes), line|
@@ -179,7 +179,7 @@ the graph, and returns — safe to use with an infinite `stream(1..)`.
 
 ## Samples
 
-### wc: `grep Ruby README.md | wc`
+### wc: `cat README.md | grep Ruby | wc`
 
 ```ruby
 lines, words, bytes =

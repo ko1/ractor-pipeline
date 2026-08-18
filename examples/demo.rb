@@ -32,7 +32,7 @@ section "filter_pipe + pipe + to_a (lanes: 1 keeps order)" do
   p result #=> [20, 40, 60, 80, 100]
 end
 
-section "wc: grep 'Ractor' #{File.basename(__FILE__)} | wc" do
+section "wc: cat #{File.basename(__FILE__)} | grep Ractor | wc" do
   lines, words, bytes =
     stream(File.foreach(__FILE__))
       .filter_pipe(lanes: 4){ it.include?("Ractor") }
