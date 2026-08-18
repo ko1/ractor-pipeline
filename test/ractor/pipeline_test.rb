@@ -12,38 +12,38 @@ class Ractor::PipelineTest < Test::Unit::TestCase
   end
 
   test "pipe + reduce" do
-    sum = stream([1, 2, 3])
-            .pipe{ it * 2 }
-            .reduce(0){ |acc, n| acc + n }
+    sum = stream([1, 2, 3]).
+            pipe{ it * 2 }.
+            reduce(0){ |acc, n| acc + n }
     assert_equal 12, sum
   end
 
   test "single-lane stages preserve order" do
-    result = stream(1..10)
-               .pipe{ it * 10 }
-               .pipe{ it + 1 }
-               .to_a
+    result = stream(1..10).
+               pipe{ it * 10 }.
+               pipe{ it + 1 }.
+               to_a
     assert_equal((1..10).map{ it * 10 + 1 }, result)
   end
 
   test "filter_pipe sends the original element" do
-    result = stream(1..10)
-               .filter_pipe{ it.even? }
-               .to_a
+    result = stream(1..10).
+               filter_pipe{ it.even? }.
+               to_a
     assert_equal [2, 4, 6, 8, 10], result
   end
 
   test "flat_pipe expands one input to many outputs" do
-    result = stream([1, 2, 3])
-               .flat_pipe{ [it] * it }
-               .to_a
+    result = stream([1, 2, 3]).
+               flat_pipe{ [it] * it }.
+               to_a
     assert_equal [1, 2, 2, 3, 3, 3], result.sort
   end
 
   test "multi-lane stage processes every element" do
-    result = stream(1..100)
-               .pipe(lanes: 4){ it * 2 }
-               .to_a
+    result = stream(1..100).
+               pipe(lanes: 4){ it * 2 }.
+               to_a
     assert_equal((1..100).map{ it * 2 }, result.sort)
   end
 
@@ -76,12 +76,12 @@ class Ractor::PipelineTest < Test::Unit::TestCase
   end
 
   test "tee broadcasts to every branch" do
-    result = stream(1..3)
-               .tee(
+    result = stream(1..3).
+               tee(
                  pipe{ [:a, it] },
                  pipe{ [:b, it] },
-               )
-               .to_a
+               ).
+               to_a
     assert_equal [[:a, 1], [:a, 2], [:a, 3], [:b, 1], [:b, 2], [:b, 3]],
                  result.sort_by{ |tag, n| [tag.to_s, n] }
   end

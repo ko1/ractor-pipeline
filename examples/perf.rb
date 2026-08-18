@@ -44,9 +44,9 @@ section "CPU-bound scaling: 16 x fib(30), pipe(lanes: n)" do
 
   [1, 2, 4, 8, 16].each do |n|
     result, dt = bench do
-      stream(1..items)
-        .pipe(lanes: n){ fib(30) }
-        .reduce(0){ |acc, v| acc + v }
+      stream(1..items).
+        pipe(lanes: n){ fib(30) }.
+        reduce(0){ |acc, v| acc + v }
     end
     raise "mismatch" unless result == expected
     report "pipe(lanes: #{n})", dt, base
@@ -77,17 +77,17 @@ section "map-reduce: word ranking, 1 document = 1 message" do
   corpus = make_corpus(160, 2_000)
 
   serial_top, base = bench do
-    corpus.map{ word_tally(it) }
-          .reduce(Hash.new(0)){ |acc, t| t.each{ |w, n| acc[w] += n }; acc }
-          .max_by(3){ |_, n| n }
+    corpus.map{ word_tally(it) }.
+          reduce(Hash.new(0)){ |acc, t| t.each{ |w, n| acc[w] += n }; acc }.
+          max_by(3){ |_, n| n }
   end
   report "serial (#{corpus.size} docs)", base
 
   parallel_top, dt = bench do
-    stream(corpus)
-      .pipe(lanes: 8){ word_tally(it) }
-      .reduce(Hash.new(0)){ |acc, t| t.each{ |w, n| acc[w] += n }; acc }
-      .max_by(3){ |_, n| n }
+    stream(corpus).
+      pipe(lanes: 8){ word_tally(it) }.
+      reduce(Hash.new(0)){ |acc, t| t.each{ |w, n| acc[w] += n }; acc }.
+      max_by(3){ |_, n| n }
   end
   report "pipe(lanes: 8) + reduce", dt, base
 
@@ -123,9 +123,9 @@ section "mandelbrot: rows in parallel, reassembled by row index" do
 
   # lanes: 8 is unordered, so carry the row index and reassemble.
   parallel_pic, dt = bench do
-    stream(0...MH)
-      .pipe(lanes: 8){ [it, mandel_row(it)] }
-      .reduce(Array.new(MH)){ |acc, (y, row)| acc[y] = row; acc }
+    stream(0...MH).
+      pipe(lanes: 8){ [it, mandel_row(it)] }.
+      reduce(Array.new(MH)){ |acc, (y, row)| acc[y] = row; acc }
   end
   report "pipe(lanes: 8)", dt, base
 
@@ -142,16 +142,16 @@ section "granularity: per-line vs per-chunk messages" do
   report "serial (#{lines.size} lines)", base
 
   line_count, dt = bench do
-    stream(lines)
-      .filter_pipe(lanes: 4){ it.include?("Ractor") }
-      .count
+    stream(lines).
+      filter_pipe(lanes: 4){ it.include?("Ractor") }.
+      count
   end
   report "per-line filter_pipe(lanes: 4)", dt, base
 
   chunk_count, dt = bench do
-    stream(lines.each_slice(1000))
-      .pipe(lanes: 4){ it.count{ |line| line.include?("Ractor") } }
-      .reduce(0){ |acc, n| acc + n }
+    stream(lines.each_slice(1000)).
+      pipe(lanes: 4){ it.count{ |line| line.include?("Ractor") } }.
+      reduce(0){ |acc, n| acc + n }
   end
   report "1000-line chunks, pipe(lanes: 4)", dt, base
 

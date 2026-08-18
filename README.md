@@ -15,9 +15,9 @@ require "ractor/pipeline"
 include Ractor::Pipeline
 
 # conceptually: cat FILE | grep foo | wc
-stream(File.foreach(name))
-  .filter_pipe(lanes: 4){ it.include?("foo") }
-  .reduce([0, 0, 0]) do |(lines, words, bytes), line|
+stream(File.foreach(name)).
+  filter_pipe(lanes: 4){ it.include?("foo") }.
+  reduce([0, 0, 0]) do |(lines, words, bytes), line|
     [lines + 1, words + line.scan(/\S+/).size, bytes + line.bytesize]
   end
 ```
@@ -112,10 +112,10 @@ downstream individually (1 input -> N outputs). Useful for feeding many
 files into one fixed-size Ractor graph:
 
 ```ruby
-stream(file_names)
-  .flat_pipe{ File.foreach(it) }            # 1 file -> N lines
-  .filter_pipe(lanes: 4){ it.include?("Ractor") }
-  .count
+stream(file_names).
+  flat_pipe{ File.foreach(it) }.           # 1 file -> N lines
+  filter_pipe(lanes: 4){ it.include?("Ractor") }.
+  count
 ```
 
 ### `tee(branch, branch, ...)`
@@ -125,12 +125,12 @@ are receiver-less fragments; their outputs are merged, unordered, into one
 downstream stream. Non-shareable elements are copied once per branch.
 
 ```ruby
-evens, odds = stream(1..10)
-                .tee(
+evens, odds = stream(1..10).
+                tee(
                   filter_pipe{ it.even? }.pipe{ [:even, it] },
                   filter_pipe{ it.odd?  }.pipe{ [:odd,  it] },
-                )
-                .reduce([[], []]) do |(evens, odds), (tag, n)|
+                ).
+                reduce([[], []]) do |(evens, odds), (tag, n)|
                   tag == :even ? [evens << n, odds] : [evens, odds << n]
                 end
 ```
@@ -142,12 +142,12 @@ them) and start the pipeline. Their blocks are ordinary blocks — no
 isolation restrictions, so a mutable accumulator is fine.
 
 ```ruby
-.reduce(initial){ |acc, elem| ... }  # returns the final accumulator
-.each{ |elem| ... }                  # yields each element, returns self
-.to_a                                # collects into an Array
-.count                               # number of output elements
-.first                               # first element (stops the pipeline)
-.first(n)                            # first n elements as an Array
+pl.reduce(initial){ |acc, elem| ... }  # returns the final accumulator
+pl.each{ |elem| ... }                  # yields each element, returns self
+pl.to_a                                # collects into an Array
+pl.count                               # number of output elements
+pl.first                               # first element (stops the pipeline)
+pl.first(n)                            # first n elements as an Array
 ```
 
 `first` terminates early: it stops feeding the source, sends EOS through
@@ -183,9 +183,9 @@ the graph, and returns — safe to use with an infinite `stream(1..)`.
 
 ```ruby
 lines, words, bytes =
-  stream(File.foreach("README.md"))
-    .filter_pipe(lanes: 4){ it.include?("Ruby") }
-    .reduce([0, 0, 0]) do |(l, w, b), line|
+  stream(File.foreach("README.md")).
+    filter_pipe(lanes: 4){ it.include?("Ruby") }.
+    reduce([0, 0, 0]) do |(l, w, b), line|
       [l + 1, w + line.scan(/\S+/).size, b + line.bytesize]
     end
 ```
@@ -196,25 +196,25 @@ One file = one message, so the boundary cost is amortized over
 file-size-scale work:
 
 ```ruby
-top5 = stream(Dir.glob("**/*.c"))
-         .pipe(lanes: 8) do
+top5 = stream(Dir.glob("**/*.c")).
+         pipe(lanes: 8) do
            tally = Hash.new(0)
            File.read(it).scan(/\w+/){ |w| tally[w] += 1 }
            tally
-         end
-         .reduce(Hash.new(0)) do |acc, tally|
+         end.
+         reduce(Hash.new(0)) do |acc, tally|
            tally.each{ |w, n| acc[w] += n }
            acc
-         end
-         .max_by(5){ |_, n| n }
+         end.
+         max_by(5){ |_, n| n }
 ```
 
 ### Unordered results: carry an index and reassemble
 
 ```ruby
-picture = stream(0...height)
-            .pipe(lanes: 8){ [it, render_row(it)] }
-            .reduce(Array.new(height)){ |acc, (y, row)| acc[y] = row; acc }
+picture = stream(0...height).
+            pipe(lanes: 8){ [it, render_row(it)] }.
+            reduce(Array.new(height)){ |acc, (y, row)| acc[y] = row; acc }
 ```
 
 ### Early termination of an infinite stream
@@ -228,9 +228,9 @@ stream(1..).pipe{ it * it }.first(5)  #=> [1, 4, 9, 16, 25]
 Per-line messages are dominated by copy/communication cost; chunk them:
 
 ```ruby
-stream(File.foreach(name).each_slice(1000))
-  .pipe(lanes: 4){ it.count{ |line| line.include?("VALUE") } }
-  .reduce(0){ |acc, n| acc + n }
+stream(File.foreach(name).each_slice(1000)).
+  pipe(lanes: 4){ it.count{ |line| line.include?("VALUE") } }.
+  reduce(0){ |acc, n| acc + n }
 ```
 
 Runnable versions of these (plus performance measurements) are in

@@ -6,9 +6,9 @@ require_relative "pipeline/version"
 #
 #   include Ractor::Pipeline
 #
-#   stream(File.foreach(name))
-#     .filter_pipe(lanes: 4){ it.include?("foo") }
-#     .reduce([0, 0, 0]) do |(lines, words, bytes), line|
+#   stream(File.foreach(name)).
+#     filter_pipe(lanes: 4){ it.include?("foo") }.
+#     reduce([0, 0, 0]) do |(lines, words, bytes), line|
 #       [lines + 1, words + line.scan(/\S+/).size, bytes + line.bytesize]
 #     end
 #
