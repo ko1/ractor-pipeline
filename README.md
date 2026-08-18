@@ -215,6 +215,28 @@ shell pipeline). Safe to use with an infinite `stream(1..)`.
   holds a Proc as its default and cannot cross the boundary — build plain
   hashes (`(h[k] ||= 0) += 1` style) in stage blocks.
 
+* **Expected errors need no special vocabulary** — write plain `rescue`
+  in the stage block. Batching is transparent, so a rescue is naturally
+  per-element; unrescued exceptions keep the fail-fast behavior above.
+
+  ```ruby
+  pipe{ JSON.parse(it) rescue DEFAULT }                    # fallback
+  pipe{ Integer(it) rescue nil }.filter_pipe{ it }         # skip bad elements
+  pipe{ begin; fetch(it); rescue Timeout::Error; retry; end }
+  ```
+
+  To collect diagnostics, wire your own stderr: a `Ractor::Port` is
+  shareable, so a stage block can capture one and report failures to the
+  caller out-of-band.
+
+  ```ruby
+  errors = Ractor::Port.new
+  result = stream(rows).
+             pipe(lanes: 8){ parse(it) rescue (errors << it; nil) }.
+             filter_pipe{ it }.
+             to_a
+  ```
+
 ## Samples
 
 ### wc: `cat README.md | grep Ruby | wc`
