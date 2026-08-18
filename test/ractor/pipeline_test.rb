@@ -100,7 +100,15 @@ class Ractor::PipelineTest < Test::Unit::TestCase
     end
   end
 
-  test "a multi-lane head pulls: the feeder does not run ahead of the source" do
+  FEED_PROBE = Ractor::Port.new
+
+  test "a multi-lane head pulls: the feeder never outruns worker demand" do
+    # The throttling guarantee is a credit invariant: every read is
+    # backed by a demand token, and tokens issued = CREDIT * lanes
+    # initially + one per processed batch. So at any point
+    #   reads <= processed + CREDIT * lanes
+    # independent of how long the terminal takes to cancel (the absolute
+    # read count does depend on scheduling; the margin does not).
     src = Object.new
     class << src
       attr_reader :reads
@@ -109,11 +117,12 @@ class Ractor::PipelineTest < Test::Unit::TestCase
         loop { yield (@reads += 1) }
       end
     end
-    stream(src).pipe(lanes: 2){ it }.first(3)
-    # Reads track consumption (demand), so the exact number depends on
-    # scheduling; without demand-driven feeding this reaches hundreds of
-    # thousands.
-    assert_operator src.reads, :<, 10_000
+    stream(src).pipe(lanes: 2){ FEED_PROBE << 1; busy_wait(20_000); it }.first(3)
+    sleep 0.2 # let cancelled workers finish their current element
+    FEED_PROBE << :end_marker
+    processed = 0
+    processed += 1 until FEED_PROBE.receive == :end_marker
+    assert_operator src.reads, :<=, processed + Ractor::Pipeline::CREDIT * 2
   end
 
   test "stream1 flows one object as a single element" do
