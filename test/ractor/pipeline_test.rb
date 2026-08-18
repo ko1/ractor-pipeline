@@ -56,6 +56,43 @@ class Ractor::PipelineTest < Test::Unit::TestCase
     assert_equal [1, 2, 3], stream([1, 2, 3]).to_a
   end
 
+  test "batching is transparent and keeps single-lane order" do
+    assert_equal((1..50).map{ it * 2 }, stream(1..50, batch: 7).pipe{ it * 2 }.to_a)
+    assert_equal [2, 4, 6, 8, 10], stream(1..10, batch: 3).filter_pipe{ it.even? }.to_a
+    assert_equal [1, 2, 2, 3, 3, 3], stream([1, 2, 3], batch: 2).flat_pipe{ [it] * it }.to_a.sort
+    assert_equal 500, stream(1..1000, batch: 64).filter_pipe(lanes: 3){ it.odd? }.count
+    assert_equal [], stream(1..10, batch: 4).filter_pipe{ false }.to_a
+  end
+
+  test "deep mixed chain with batching" do
+    expected = (1..300).map{ it + 1 }.reject{ it % 3 == 0 }.map{ it * 2 }.
+                        flat_map{ [it, it + 1] }.select(&:even?).map{ it - 1 }.sort
+    [1, 7].each do |b|
+      result = stream(1..300, batch: b).
+                 pipe{ it + 1 }.
+                 filter_pipe{ it % 3 != 0 }.
+                 pipe(lanes: 4){ it * 2 }.
+                 flat_pipe{ [it, it + 1] }.
+                 filter_pipe(lanes: 2){ it.even? }.
+                 pipe{ it - 1 }.
+                 to_a
+      assert_equal expected, result.sort
+    end
+  end
+
+  test "a multi-lane head pulls: the feeder does not run ahead of the source" do
+    src = Object.new
+    class << src
+      attr_reader :reads
+      def each
+        @reads = 0
+        loop { yield (@reads += 1) }
+      end
+    end
+    stream(src).pipe(lanes: 2){ it }.first(3)
+    assert_operator src.reads, :<, 100
+  end
+
   test "stream1 flows one object as a single element" do
     assert_equal [42], stream1(42).to_a
     # even an each-able object is a single element

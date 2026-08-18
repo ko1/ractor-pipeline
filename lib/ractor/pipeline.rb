@@ -13,56 +13,67 @@ require_relative "pipeline/version"
 #     end
 #
 # Execution model:
-#   * stream(source) feeds each element of the source into the pipeline
-#     (from a Thread in the caller Ractor, concurrently with the terminal
-#     operation).
+#   * stream(source, batch: k) feeds the source into the pipeline from a
+#     Thread in the caller Ractor, k elements per message (default 1).
+#     Batching is transparent: stage blocks always see single elements.
 #   * pipe/filter_pipe/flat_pipe are persistent Ractor stages; each stage
-#     spawns `lanes:` (default 1) worker Ractors which repeatedly
-#     receive from their input Port and send results downstream.
+#     spawns `lanes:` (default 1) worker Ractors at terminal-operation
+#     time. Workers process many elements; no Ractor is created per
+#     element.
+#   * Boundaries into a multi-lane stage (lanes > 1) are demand-driven
+#     (pull): a lane worker sends a ready token upstream when it can take
+#     more work, and producers send a batch only to a worker they hold a
+#     token for (CREDIT tokens per producer/consumer pair). A busy worker
+#     stops sending tokens, so work never piles up behind it. Boundaries
+#     with a single consumer (lanes: 1 stages, and the terminal) are plain
+#     push.
+#   * When the head stage is multi-lane, the feeder reads the source only
+#     while it holds tokens, so a fast or infinite source cannot flood the
+#     pipeline.
 #   * tee broadcasts each element to every branch; branch outputs are
 #     merged (unordered) into one downstream stream.
 #   * reduce/each/to_a/count/first are terminal operations executed in the
-#     caller Ractor; no Ractor is created for them.
+#     caller Ractor.
 #
-# Semantics notes (initial implementation):
-#   * A stage with lanes: 1 preserves input order. A stage with
-#     lanes: n > 1 is unordered: elements are distributed to the lanes by
-#     round-robin and forwarded in completion order.
-#   * End of stream is propagated by an EOS sentinel. Each worker knows
-#     the number of upstream producers and finishes after receiving that
-#     many EOS, then broadcasts EOS to all downstream ports.
+# Semantics notes:
+#   * Ordering: a chain of lanes: 1 stages preserves input order (also
+#     with batch:). Multi-lane stages are unordered.
+#   * End of stream is an in-band EOS message: each worker counts EOS from
+#     its upstream producers, drains its buffered output, and then
+#     broadcasts EOS downstream, so fan-in and fan-out shut down cleanly.
+#   * Cancellation (first, exceptions): the terminal closes its out_port
+#     and broadcasts a cancel message to every worker. Workers exit
+#     immediately, dropping their backlog; sends to closed ports raise
+#     Ractor::ClosedError and cascade the closure upstream (SIGPIPE-style).
 #   * Non-shareable objects are deep-copied at each Ractor boundary
-#     (Ractor::Port#send default). In particular, tee copies an element
-#     once per branch.
+#     (Ractor::Port#send default). tee copies an element once per branch.
 #   * Stage blocks are isolated with Ractor.shareable_proc at DSL
 #     construction time: they may capture shareable outer values (they are
 #     snapshotted), and capturing a non-shareable value raises
 #     Ractor::IsolationError at pipe/filter_pipe/flat_pipe call time.
-#   * An exception raised in a stage block is wrapped in Failure, flows
-#     down the pipeline, and is re-raised by the terminal operation in the
-#     caller Ractor. Remaining workers are shut down by EOS.
-#   * Ports are unbounded, so there is no backpressure (and no deadlock).
+#   * An exception raised in a stage block cancels the pipeline and is
+#     re-raised by the terminal operation in the caller Ractor.
+#   * Push links are unbounded (no backpressure); pull links are bounded
+#     by CREDIT batches per producer/consumer pair.
+#
+# Message protocol (one input Port per worker; messages are tagged):
+#   [:init, groups, ups, n_producers, batch_size]
+#            groups: [[ports, pull?], ...] one per fan-out destination
+#   [:data, batch, from]   # from: replenish target on pull links, else nil
+#   [:ready, port]         # demand token (pull links only)
+#   [:eos]                 # counted per upstream producer
+#   [:failure, exception]  # forwarded to the terminal, which raises it
+#   [:cancel]
 class Ractor
   module Pipeline
     class Error < StandardError; end
 
-    # End-of-stream sentinel. A class object is shareable, so its identity
-    # is preserved across Ractor boundaries.
-    class EOS; end
+    CREDIT = 2 # ready tokens per (producer, consumer) pair on pull links
 
-    # Carries an exception raised in a stage block to the terminal operation.
-    class Failure
-      attr_reader :exception
-
-      def initialize(exception)
-        @exception = exception
-      end
-    end
-
-    Stage = Struct.new(:kind, :lanes, :job, :branches, :n_producers)
-
-    STOP = Object.new # throw tag for early termination (used in the caller Ractor only)
+    STOP = Object.new # throw tag for early termination (caller Ractor only)
     private_constant :STOP
+
+    Stage = Struct.new(:kind, :lanes, :job, :branches)
 
     # Common stage-building vocabulary for Source and Branch.
     module Stages
@@ -121,9 +132,11 @@ class Ractor
     class Source
       include Stages
 
-      def initialize(source)
+      def initialize(source, batch: 1)
         raise ArgumentError, "source must respond to #each" unless source.respond_to?(:each)
+        raise ArgumentError, "batch: must be an Integer >= 1" unless Integer === batch && batch >= 1
         @source = source
+        @batch = batch
       end
 
       # -- terminal operations (executed in the caller Ractor) -----------
@@ -168,49 +181,87 @@ class Ractor
 
       private
 
-      # Wire up the pipeline, feed the source, and yield each output
-      # element to the given block.
-      def run
-        out_port = Ractor::Port.new
-        ctrl = Ractor::Port.new
-        n_out = Pipeline.annotate(stages, 1)
-        head_groups = Pipeline.spawn_stages(stages, [[out_port]], ctrl)
+      # A concrete stage placement in the wiring graph. downs holds the
+      # fan-out destinations (Node or :out); producers the upstream Nodes
+      # (empty = fed by the source feeder).
+      Node = Struct.new(:kind, :lanes, :job, :downs, :producers, :ports)
 
-        # Feed the source concurrently so that terminal consumption
-        # overlaps with production.
-        feeder = Thread.new do
-          rr = 0
-          begin
-            @source.each do |obj|
-              head_groups.each { |group| group[rr % group.size] << obj }
-              rr += 1
-            end
-          rescue Exception => e
-            head_groups.first.first << Failure.new(e)
-          ensure
-            head_groups.each { |group| group.each { |port| port << EOS rescue nil } }
+      # Builds Nodes for a stage list, from downstream to upstream.
+      # Returns the head destinations (what the previous producer feeds).
+      def plan(stage_list, downs, nodes)
+        stage_list.reverse_each.inject(downs) do |dwn, st|
+          if st.kind == :tee
+            st.branches.flat_map { |br_stages| plan(br_stages, dwn, nodes) }
+          else
+            node = Node.new(st.kind, st.lanes, st.job, dwn, [])
+            nodes << node
+            [node]
           end
         end
+      end
+
+      def run
+        nodes = []
+        heads = plan(stages, [:out], nodes)
+        nodes.each do |node|
+          node.downs.each { |dest| dest.producers << node if Node === dest }
+        end
+        n_out = nodes.sum { |node| node.downs.include?(:out) ? node.lanes : 0 }
+        n_out = 1 if stages.empty? # fed directly by the feeder
+
+        out_port = Ractor::Port.new
+        feed_port = Ractor::Port.new
+        ctrl = Ractor::Port.new
+
+        # spawn workers (they wait for [:init]) and collect their ports
+        nodes.each do |node|
+          node.lanes.times do |i|
+            Ractor.new(ctrl, node.job, node.kind, name: "pipeline/#{node.kind}[#{i}]") do |ctrl, job, kind|
+              Ractor::Pipeline.worker_loop(ctrl, job, kind)
+            end
+          end
+          node.ports = node.lanes.times.map { ctrl.receive }
+        end
+        all_ports = nodes.flat_map(&:ports)
+
+        # wire up
+        group_for = ->(dest) do
+          dest == :out ? [[out_port], false] : [dest.ports, dest.lanes > 1]
+        end
+        nodes.each do |node|
+          groups = node.downs.map(&group_for)
+          ups = if node.lanes > 1
+                  node.producers.empty? ? [feed_port] : node.producers.flat_map(&:ports)
+                else
+                  []
+                end
+          npro = node.producers.empty? ? 1 : node.producers.sum(&:lanes)
+          node.ports.each { |port| port << [:init, groups, ups, npro, @batch] }
+        end
+        head_groups = heads.map(&group_for)
+
+        feeder = Thread.new { feed(feed_port, head_groups) }
 
         eos = 0
         early = catch(STOP) do
           loop do
             msg = out_port.receive
-            if EOS.equal?(msg)
+            case msg[0]
+            when :data
+              msg[1].each { |obj| yield obj }
+            when :eos
               eos += 1
               break if eos == n_out
-            elsif Failure === msg
-              shutdown(feeder, out_port, head_groups)
-              raise msg.exception
-            else
-              yield msg
+            when :failure
+              shutdown(feeder, out_port, all_ports)
+              raise msg[1]
             end
           end
           false
         end
 
         if early
-          shutdown(feeder, out_port, head_groups)
+          shutdown(feeder, out_port, all_ports)
         else
           feeder.join
           out_port.close
@@ -218,114 +269,184 @@ class Ractor
         nil
       end
 
-      # Cancel the stream: closing out_port makes the tail workers' sends
-      # raise Ractor::ClosedError and the closure cascades upstream, so
-      # busy workers stop without draining their backlog. Idle workers
-      # (blocked on an empty queue, nothing to send) cannot see the
-      # cascade, so EOS is still sent to wake and drain them.
-      def shutdown(feeder, out_port, head_groups)
+      # Feed the source, batching elements. Pull destinations receive a
+      # batch only when they granted a token, so the feeder never runs far
+      # ahead of a multi-lane head stage; push destinations are direct.
+      def feed(feed_port, head_groups)
+        tokens = Pipeline.token_pools(head_groups)
+        port_group = {}
+        head_groups.each_with_index do |(ports, pull), gi|
+          ports.each { |port| port_group[port] = gi } if pull
+        end
+
+        fill = lambda do |gi|
+          until (port = tokens[gi].take)
+            msg = feed_port.receive
+            case msg[0]
+            when :ready then tokens[port_group[msg[1]]].add(msg[1])
+            when :cancel then throw :cancelled
+            end
+          end
+          port
+        end
+        emit = lambda do |buf|
+          head_groups.each_with_index do |(ports, pull), gi|
+            if pull
+              fill.call(gi) << [:data, buf, feed_port]
+            else
+              ports.first << [:data, buf, nil]
+            end
+          end
+        end
+
+        catch(:cancelled) do
+          begin
+            buf = []
+            @source.each do |obj|
+              buf << obj
+              if buf.size >= @batch
+                emit.call(buf)
+                buf = []
+              end
+            end
+            emit.call(buf) unless buf.empty?
+          rescue Ractor::ClosedError
+            next # cancelled
+          rescue Exception => e
+            head_groups.first.first.first << [:failure, e] rescue nil
+          end
+          head_groups.each { |ports, _| ports.each { |port| port << [:eos] rescue nil } }
+        end
+      end
+
+      # Cancel: wake every worker (they may be idle or waiting for demand)
+      # and close out_port so in-flight sends fail and cascade upstream.
+      def shutdown(feeder, out_port, all_ports)
         feeder.kill
         feeder.join
+        all_ports.each { |port| port << [:cancel] rescue nil }
         out_port.close
-        head_groups.each { |group| group.each { |port| port << EOS rescue nil } }
+      end
+    end
+
+    # Demand tokens of one pull group. Tokens are granted round-robin over
+    # the consumers (not in token arrival order): each consumer sends its
+    # CREDIT initial tokens in a burst, and handing them out in arrival
+    # order would cluster consecutive batches on the same worker.
+    class TokenPool
+      def initialize
+        @counts = Hash.new(0)
+        @order = []
+      end
+
+      def add(port)
+        @order << port unless @counts.key?(port)
+        @counts[port] += 1
+      end
+
+      def take
+        @order.size.times do
+          port = @order.shift
+          @order.push(port)
+          return port if @counts[port] > 0 && (@counts[port] -= 1 || true)
+        end
+        nil
       end
     end
 
     class << self
-      # Records how many upstream producers feed each stage (the number of
-      # EOS messages each worker must observe before finishing) and
-      # returns the number of producers feeding whatever follows `stages`.
-      def annotate(stages, n_in)
-        stages.each do |st|
-          st.n_producers = n_in
-          if st.kind == :tee
-            n_in = st.branches.sum { |br_stages| annotate(br_stages, n_in) }
-          else
-            n_in = st.lanes
-          end
-        end
-        n_in
+      def token_pools(groups)
+        groups.map { TokenPool.new }
       end
 
-      # Spawns worker Ractors from downstream to upstream.
-      #
-      # down_groups is an Array of port groups the current tail stage must
-      # send to: one element per fan-out destination, each element being
-      # the input ports of that destination's workers. An element is sent
-      # to one (round-robin) port of every group; EOS is broadcast to all
-      # ports of all groups.
-      #
-      # Returns the port groups for the pipeline head (what the source
-      # feeder must send to).
-      def spawn_stages(stages, down_groups, ctrl)
-        stages.reverse_each do |st|
-          if st.kind == :tee
-            down_groups = st.branches.flat_map { |br_stages| spawn_stages(br_stages, down_groups, ctrl) }
-          else
-            st.lanes.times do |i|
-              Ractor.new(ctrl, down_groups, st.n_producers, st.job, st.kind, i,
-                         name: "pipeline/#{st.kind}[#{i}]") do |*args|
-                Ractor::Pipeline.worker_loop(*args)
-              end
-            end
-            # Workers create their own input Port (Port#receive is
-            # restricted to the creating Ractor) and report it via ctrl.
-            down_groups = [st.lanes.times.map { ctrl.receive }]
-          end
-        end
-        down_groups
-      end
-
-      # The main loop of a persistent stage worker.
-      def worker_loop(ctrl, down_groups, n_producers, job, kind, index)
+      # The main loop of a stage worker. Stateless between streams except
+      # for the demand bookkeeping of its (per-run) wiring.
+      def worker_loop(ctrl, job, kind)
         in_port = Ractor::Port.new
         ctrl << in_port
 
-        rr = index # start position varies per worker to spread the load
+        # wait for [:init]; queue anything that arrives earlier
+        early = []
+        msg = in_port.receive
+        until msg[0] == :init
+          early << msg
+          msg = in_port.receive
+        end
+        _, groups, ups, n_producers, batch_size = msg
+
+        tokens = Pipeline.token_pools(groups) # demand tokens, per pull group
+        pending = groups.map { [] }           # batches waiting for a token
+        port_group = {}
+        groups.each_with_index do |(ports, pull), gi|
+          ports.each { |port| port_group[port] = gi } if pull
+        end
         eos = 0
-        emit = ->(obj) do
-          down_groups.each { |group| group[rr % group.size] << obj }
-          rr += 1
+
+        dispatch = lambda do |batch|
+          groups.each_with_index do |(ports, pull), gi|
+            if !pull
+              ports.first << [:data, batch, nil]
+            elsif (port = tokens[gi].take)
+              port << [:data, batch, in_port]
+            else
+              pending[gi] << batch
+            end
+          end
         end
 
-        loop do
-          msg = in_port.receive
-          if EOS.equal?(msg)
-            eos += 1
-            break if eos == n_producers
-          elsif Failure === msg
-            emit.call(msg) # pass failures through to the terminal operation
-          else
+        handle = lambda do |m|
+          case m[0]
+          when :data
             begin
               case kind
               when :pipe
-                emit.call(job.call(msg))
+                dispatch.call(m[1].map { |obj| job.call(obj) })
               when :filter_pipe
-                emit.call(msg) if job.call(msg)
+                out = m[1].select { |obj| job.call(obj) }
+                dispatch.call(out) unless out.empty?
               when :flat_pipe
-                job.call(msg).each { |obj| emit.call(obj) }
+                out = []
+                m[1].each { |obj| job.call(obj).each { |o| out << o } }
+                out.each_slice(batch_size) { |slice| dispatch.call(slice) }
               end
             rescue Ractor::ClosedError
               raise
             rescue Exception => e
-              emit.call(Failure.new(e))
+              groups.first.first.first << [:failure, e] rescue nil
             end
+            (m[2] << [:ready, in_port] rescue nil) if m[2] # replenish credit
+          when :ready
+            gi = port_group[m[1]]
+            if (batch = pending[gi].shift)
+              m[1] << [:data, batch, in_port]
+            else
+              tokens[gi].add(m[1])
+            end
+          when :eos
+            eos += 1
+          when :failure
+            groups.first.first.first << m rescue nil # pass through
+          when :cancel
+            throw :cancelled
           end
         end
 
-        # All upstream producers finished; propagate EOS downstream.
-        down_groups.each { |group| group.each { |port| port << EOS rescue nil } }
+        catch(:cancelled) do
+          ups.each { |up| CREDIT.times { up << [:ready, in_port] rescue nil } }
+          early.each { |m| handle.call(m) }
+          handle.call(in_port.receive) until eos == n_producers
+          # all producers finished: drain buffered batches, then EOS
+          handle.call(in_port.receive) until pending.all?(&:empty?)
+          groups.each { |ports, _| ports.each { |port| port << [:eos] rescue nil } }
+        end
       rescue Ractor::ClosedError
-        # A downstream port is closed: the stream was cancelled (the
-        # terminal operation closed its out_port, like SIGPIPE in a shell
-        # pipeline). Exit without draining the backlog; our own ports
-        # close with this Ractor, so the closure cascades upstream.
+        # a consumer is gone: the stream was cancelled (SIGPIPE-style)
       end
     end
 
     # -- DSL entry points ------------------------------------------------
 
-    def stream(source) = Source.new(source)
+    def stream(source, batch: 1) = Source.new(source, batch:)
 
     # A stream of exactly one element: stream1(obj) == stream([obj]).
     # Use it to flow an object (even an each-able one) as a single element.

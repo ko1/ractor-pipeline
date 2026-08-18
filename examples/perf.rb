@@ -155,8 +155,29 @@ section "granularity: per-line vs per-chunk messages" do
   end
   report "1000-line chunks, pipe(lanes: 4)", dt, base
 
-  raise "mismatch" unless serial_count == line_count && serial_count == chunk_count
+  batch_count, dt = bench do
+    stream(lines, batch: 1000).
+      filter_pipe(lanes: 4){ it.include?("Ractor") }.
+      count
+  end
+  report "batch: 1000 (transparent)", dt, base
+
+  raise "mismatch" unless serial_count == line_count && serial_count == chunk_count && serial_count == batch_count
   puts "  matching lines: #{serial_count}"
+end
+
+def busy(n) = (i = 0; i += 1 while i < n; i)
+
+section "load balancing: one heavy element among light ones (lanes: 4)" do
+  # Demand-driven distribution: no new work is assigned to the worker
+  # that is stuck on the heavy element.
+  jobs = [40_000_000] + [4_000_000] * 31
+
+  _, base = bench{ jobs.each{ busy(it) } }
+  report "serial", base
+
+  _, dt = bench{ stream(jobs).pipe(lanes: 4){ busy(it) }.each{} }
+  report "pipe(lanes: 4)", dt, base
 end
 
 puts

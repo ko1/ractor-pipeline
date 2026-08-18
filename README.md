@@ -26,6 +26,18 @@ stream(File.foreach(name)).
 File.foreach ──> filter Ractor x4 ──> Port ──> reduce in caller
 ```
 
+Key properties:
+
+* **1 stage = `lanes:` persistent Ractors** — workers process many
+  elements; no Ractor is created per element.
+* **Demand-driven scheduling** — a multi-lane stage is fed by pull: a
+  worker gets a new batch only when it asks for one, so a stuck worker
+  never has work piling up behind it, and a fast or infinite source is
+  read only as fast as the pipeline consumes it.
+* **Transparent batching** — `stream(src, batch: 1000)` packs 1000
+  elements per message to amortize the per-message cost; stage blocks
+  still see single elements.
+
 Requires Ruby 4.0+ (`Ractor::Port`, `Ractor.shareable_proc`). The Ractor API
 is experimental, and so is this library.
 
@@ -33,10 +45,10 @@ is experimental, and so is this library.
 
 | DSL | Enumerable analogue | topology |
 |---|---|---|
-| `stream(src)` | `src.each` | source (fed from the caller) |
+| `stream(src, batch: k)` | `src.each` | source (fed from the caller) |
 | `stream1(obj)` | `[obj].each` | single-element source |
 | `.pipe{ f(it) }` | `map` | 1 persistent Ractor |
-| `.pipe(lanes: n){}` | `map` | n Ractors, round-robin, unordered |
+| `.pipe(lanes: n){}` | `map` | n Ractors, demand-driven, unordered |
 | `.filter_pipe{ pred(it) }` | `filter` | 1 Ractor (sends the original element) |
 | `.flat_pipe{ enum }` | `flat_map` | 1 input -> N outputs |
 | `.tee(pipe{}, pipe{})` | — | broadcast to branches, merged output |
@@ -49,7 +61,7 @@ is experimental, and so is this library.
 the pipeline object, so they chain; nothing runs until a terminal operation
 is called.
 
-### `stream(source)`
+### `stream(source, batch: 1)`
 
 Creates a pipeline whose input is each element of `source` (anything that
 responds to `each`). Elements are fed from a background Thread in the
@@ -62,6 +74,18 @@ stream(1..)                 # infinite stream (terminate with .first etc.)
 stream(File.foreach(name))  # one element per line
 ```
 
+`batch: k` packs k elements into one message. This is transparent — stage
+blocks still receive one element at a time — and it amortizes the
+per-message cost (sync + copy + envelope) over k elements, which matters
+whenever the work per element is small (see
+[Measured performance](#measured-performance)). Batches shrink through
+`filter_pipe` and are re-split to `<= k` after `flat_pipe`; the message
+*count* is unchanged, so the amortization survives filtering.
+
+When the first stage is multi-lane, the source is read on demand: the
+feeder only reads ahead by the workers' open demand tokens, so
+`stream(huge_or_infinite_source)` does not balloon memory.
+
 `stream1(obj)` is a shorthand for `stream([obj])`: it flows `obj` as a
 single element, even when `obj` itself is each-able.
 
@@ -72,16 +96,18 @@ stream1(config).pipe{ build(it) }.first
 ### `pipe(lanes: 1){ block }`
 
 A processing stage: applies the block to each element and sends the return
-value downstream. The current element is `it`. One stage = one persistent
-Ractor (per lane) that processes many elements; Ractors are *not* created
-per element.
+value downstream. The current element is `it`.
 
 ```ruby
 stream([1, 2, 3]).pipe{ it * 2 }.to_a  #=> [2, 4, 6]
 ```
 
-With `lanes: n`, the stage becomes n worker Ractors. Elements are
-distributed round-robin and forwarded in completion order (unordered; see
+With `lanes: n`, the stage becomes n worker Ractors and the boundary into
+it becomes demand-driven: each worker grants a small number of demand
+tokens (2 per producer) and producers send a batch only to a worker they
+hold a token for. A worker that is stuck on an expensive element simply
+stops granting tokens, so the work is distributed by actual availability,
+not round-robin. Completion order is not preserved (see
 [Ordering](#ordering)).
 
 ```ruby
@@ -95,6 +121,10 @@ processes element k, stage 1 processes element k+1:
 stream(src).pipe{ parse(it) }.pipe{ format(it) }
 #  src ──> Ractor(parse) ──> Ractor(format) ──> ...
 ```
+
+Boundaries into a single consumer (a `lanes: 1` stage, or the terminal
+operation) are plain push over the port's FIFO: no demand round-trip, no
+reordering.
 
 ### `filter_pipe(lanes: 1){ block }`
 
@@ -150,13 +180,16 @@ pl.first                               # first element (stops the pipeline)
 pl.first(n)                            # first n elements as an Array
 ```
 
-`first` terminates early: it stops feeding the source, sends EOS through
-the graph, and returns — safe to use with an infinite `stream(1..)`.
+`first` cancels the rest of the stream: it stops the feeder, closes its
+output port, and broadcasts a cancel message, so workers drop their
+backlog and terminate immediately (in-flight sends to closed ports raise
+`Ractor::ClosedError` and cascade the shutdown upstream, like SIGPIPE in a
+shell pipeline). Safe to use with an infinite `stream(1..)`.
 
 ### Errors
 
-* An exception raised in a stage block is wrapped, flows down the
-  pipeline, and is re-raised by the terminal operation in the caller:
+* An exception raised in a stage block cancels the pipeline and is
+  re-raised by the terminal operation in the caller:
 
   ```ruby
   stream(1..10).pipe{ raise "boom" if it == 5; it }.to_a
@@ -177,6 +210,11 @@ the graph, and returns — safe to use with an infinite `stream(1..)`.
   stream(1..3).pipe{ buf << it.to_s }    #=> Ractor::IsolationError at .pipe
   ```
 
+* Everything a stage block returns must be sendable through a
+  `Ractor::Port`. A common gotcha: a Hash built with `Hash.new{ ... }`
+  holds a Proc as its default and cannot cross the boundary — build plain
+  hashes (`(h[k] ||= 0) += 1` style) in stage blocks.
+
 ## Samples
 
 ### wc: `cat README.md | grep Ruby | wc`
@@ -190,23 +228,17 @@ lines, words, bytes =
     end
 ```
 
-### map-reduce: word ranking over many files
+### Log crunching: parse JSONL, aggregate per path
 
-One file = one message, so the boundary cost is amortized over
-file-size-scale work:
+One message carries a chunk of lines; each stage worker parses its chunk
+and returns a small pre-aggregated hash, so the caller-side reduce merges
+`#chunks` hashes instead of touching every record
+(runnable version: [examples/logstats.rb](examples/logstats.rb)):
 
 ```ruby
-top5 = stream(Dir.glob("**/*.c")).
-         pipe(lanes: 8) do
-           tally = Hash.new(0)
-           File.read(it).scan(/\w+/){ |w| tally[w] += 1 }
-           tally
-         end.
-         reduce(Hash.new(0)) do |acc, tally|
-           tally.each{ |w, n| acc[w] += n }
-           acc
-         end.
-         max_by(5){ |_, n| n }
+stats = stream(lines.each_slice(1000)).
+          pipe(lanes: 8){ aggregate(it) }.      # chunk -> {path => [req, err, ms]}
+          reduce({}){ |acc, st| merge(acc, st) }
 ```
 
 ### Unordered results: carry an index and reassemble
@@ -223,42 +255,84 @@ picture = stream(0...height).
 stream(1..).pipe{ it * it }.first(5)  #=> [1, 4, 9, 16, 25]
 ```
 
-### Chunking for fine-grained sources
-
-Per-line messages are dominated by copy/communication cost; chunk them:
+### Fine-grained sources: use batch:
 
 ```ruby
-stream(File.foreach(name).each_slice(1000)).
-  pipe(lanes: 4){ it.count{ |line| line.include?("VALUE") } }.
-  reduce(0){ |acc, n| acc + n }
+stream(File.foreach(name), batch: 1000).
+  filter_pipe(lanes: 4){ it.include?("VALUE") }.
+  count
 ```
 
-Runnable versions of these (plus performance measurements) are in
-[examples/demo.rb](examples/demo.rb) and [examples/perf.rb](examples/perf.rb).
+More runnable samples: [examples/demo.rb](examples/demo.rb) (feature tour),
+[examples/perf.rb](examples/perf.rb) and
+[examples/readme_bench.rb](examples/readme_bench.rb) (the measurements
+below).
 
-## Semantics notes (initial implementation)
+## Semantics notes
 
-* <a name="ordering"></a>**Ordering**: `lanes: 1` chains preserve input
-  order. Multi-lane stages are unordered (elements overtake each other
-  across lanes); within one lane, order is preserved.
+* <a name="ordering"></a>**Ordering**: a chain of `lanes: 1` stages
+  preserves input order, with or without `batch:`. Multi-lane stages are
+  unordered (elements overtake each other across lanes).
 * **Boundaries copy**: non-shareable objects are deep-copied at each Ractor
   boundary (`Ractor::Port#send` default); shareable objects are passed by
   reference.
-* **End of stream** propagates via a sentinel: each worker counts EOS from
-  its upstream producers and then broadcasts EOS downstream, so fan-in and
-  fan-out shut down cleanly.
-* **No backpressure**: ports are unbounded queues (and therefore there is
-  no deadlock, but also no flow control for a slow consumer).
+* **End of stream** propagates via an in-band EOS message: each worker
+  counts EOS from its upstream producers, drains its buffered output, and
+  broadcasts EOS downstream, so fan-in and fan-out shut down cleanly.
+* **Cancellation** (`first`, exceptions) closes the terminal's port and
+  broadcasts cancel; workers drop their backlog and exit, and the closure
+  cascades upstream via `Ractor::ClosedError` (SIGPIPE-style).
+* **Backpressure**: demand-driven boundaries are bounded (2 batches per
+  producer/consumer pair), and a multi-lane head stage throttles the
+  source itself. Push boundaries (into `lanes: 1` stages and the terminal)
+  are unbounded FIFO queues.
 
-## Performance notes
+## Measured performance
 
-* Message granularity dominates: one message per *line* of a file can be
-  ~100x slower than one message per file or per 1000-line chunk. Amortize
-  the boundary cost over enough work per message.
-* Keep stage blocks allocation-light; allocation throughput scales worse
-  across Ractors than pure computation.
-* DSL overhead vs hand-written persistent Ractors is negligible when a
-  message carries >= ~1ms of work.
+Numbers from `examples/readme_bench.rb` (min of 5 runs) on Ruby 4.1.0dev
+(2026-08-18 master, 98b3b8034d) on a 20-thread laptop (Core i7-1370P,
+6P+8E cores, WSL2). Absolute numbers vary a lot with machine, clocks, and
+Ruby version — treat them as shape, not truth. Ruby 4.0.2 behaves
+similarly except that multi-Ractor CPU throughput at high lane counts is
+~25% lower.
+
+**Lanes sweep** — speedup over serial for `pipe(lanes: n)`:
+
+| workload (serial time) | lanes 2 | lanes 4 | lanes 8 | lanes 16 |
+|---|---|---|---|---|
+| fib(28) x 32, uniform CPU (0.52s) | x1.9 | x3.3 | x2.6 | x5.5 |
+| skewed load, 1 heavy + 31 light (0.85s) | x1.8 | x3.2 | x2.8 | x2.4 |
+| mandelbrot, 48 uneven rows (0.32s) | x2.4 | x4.5 | x5.3 | x6.9 |
+| JSONL aggregation, 400k lines (0.25s) | x1.6 | x2.8 | x2.4 | x2.0 |
+
+Notes:
+
+* **Skewed load** is bounded by the heavy element itself (optimal makespan
+  ~x2.8 here); demand-driven distribution saturates that bound from
+  `lanes: 4` on. Blind round-robin caps at ~x2.4 because elements queued
+  behind the heavy one cannot move to an idle worker.
+* **JSONL parsing is allocation-bound**, and allocation throughput scales
+  worse across Ractors than pure computation, so extra lanes stop helping
+  early. Pre-aggregate in the workers and keep boundary objects small.
+* The recurring dip at `lanes: 8` is a machine artifact of this hybrid
+  P/E-core laptop under WSL2 (eight busy workers get placed badly), not a
+  property of the lane count. Expect ±20% run-to-run variance from clock
+  scaling in every cell.
+
+**Message granularity** — trivial filter over 100k short lines:
+
+| serial | 1 line = 1 message | `batch: 1000` |
+|---|---|---|
+| 0.011s | 1.56s | 0.021s |
+
+Per-element messages cost ~1µs each (sync + copy + envelope); batching
+amortizes that ~75x. Rule of thumb: aim for >= 1ms of work per message,
+via `batch:` or by chunking the source.
+
+**Source throttling** — infinite source, `pipe(lanes: 2){ it }.first(3)`:
+the source's `each` is invoked a few dozen times at most (5–40 across
+runs). A push-fed pipeline reads hundreds of thousands of elements before
+the cancellation lands.
 
 ## License
 
