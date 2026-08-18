@@ -12,7 +12,8 @@ Gem::Specification.new do |spec|
   spec.description = "Ractor::Pipeline provides a shell-pipeline-like DSL " \
                      "(stream/pipe/filter_pipe/flat_pipe/tee/lanes) where each " \
                      "stage is a persistent Ractor, making the execution topology " \
-                     "visible in the code."
+                     "visible in the code. Multi-lane stages are fed by demand " \
+                     "(pull) and sources can be batched transparently."
   spec.homepage = "https://github.com/ko1/ractor-pipeline"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 4.0" # Ractor::Port, Ractor.shareable_proc

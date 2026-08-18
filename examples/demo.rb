@@ -87,6 +87,23 @@ section "flat_pipe: 1 input -> N outputs" do
   puts "lines containing 'section' (x3): #{count}"
 end
 
+section "batch: transparent batching (blocks still see single elements)" do
+  result = stream(1..10, batch: 3).
+             filter_pipe{ it.even? }.
+             pipe{ it * 10 }.
+             to_a
+  p result #=> [20, 40, 60, 80, 100] (batch 越しでも lanes: 1 は順序保持)
+end
+
+section "throttling: a multi-lane head reads the source on demand" do
+  reads = 0
+  counting = Enumerator.new do |y|
+    loop { y << (reads += 1) }
+  end
+  stream(counting).pipe(lanes: 2){ it }.first(3)
+  puts "source reads: #{reads} (push だと数十万読む)"
+end
+
 section "first: early termination of an infinite stream" do
   result = stream(1..).
              pipe{ it * it }.

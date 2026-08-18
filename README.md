@@ -334,6 +334,34 @@ the source's `each` is invoked a few dozen times at most (5–40 across
 runs). A push-fed pipeline reads hundreds of thousands of elements before
 the cancellation lands.
 
+## vs the parallel gem
+
+The [parallel](https://github.com/grosser/parallel) gem is a data-parallel
+`map` over a ready-made collection using forked processes (or threads);
+Ractor::Pipeline is an in-process streaming topology. On the overlapping
+map-shaped workloads (`examples/vs_parallel.rb`, same machine/Ruby as
+above, parallel 2.1.0):
+
+| workload | Ractor::Pipeline | Parallel processes | Parallel threads |
+|---|---|---|---|
+| 32 x fib(28), 16-way | **x6.6** | x4.6 | x1.0 (GVL) |
+| skewed load, 4-way | x3.3 | x3.4 | — |
+| JSONL aggregation, 8-way | **x2.5** | x1.7 | x0.8 |
+| 10k trivial jobs, 4-way | 0.002s | 0.510s | — |
+
+* Threads cannot help CPU-bound work under the GVL; processes and Ractors
+  both can.
+* Both distribute work by demand, so skewed load balances equally well.
+* Ractor messages are in-process copies, cheaper than fork + Marshal over
+  pipes: the gap widens when jobs carry data (JSONL: x2.5 vs x1.7) and
+  becomes decisive for small jobs (250x on trivial jobs, thanks to
+  `batch:` and reusable workers).
+* What Parallel cannot express at all: multi-stage pipelines (stages
+  running concurrently), infinite/throttled sources, and early
+  cancellation of a running stream. What Parallel gives you instead:
+  full process isolation and compatibility with any Ruby object without
+  shareability rules.
+
 ## License
 
 MIT. See [LICENSE.txt](LICENSE.txt).
