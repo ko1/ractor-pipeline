@@ -200,7 +200,7 @@ class Ractor
               eos += 1
               break if eos == n_out
             elsif Failure === msg
-              shutdown(feeder, head_groups)
+              shutdown(feeder, out_port, head_groups)
               raise msg.exception
             else
               yield msg
@@ -210,17 +210,23 @@ class Ractor
         end
 
         if early
-          shutdown(feeder, head_groups)
+          shutdown(feeder, out_port, head_groups)
         else
           feeder.join
+          out_port.close
         end
         nil
       end
 
-      # Stop feeding and let all workers drain and terminate via EOS.
-      def shutdown(feeder, head_groups)
+      # Cancel the stream: closing out_port makes the tail workers' sends
+      # raise Ractor::ClosedError and the closure cascades upstream, so
+      # busy workers stop without draining their backlog. Idle workers
+      # (blocked on an empty queue, nothing to send) cannot see the
+      # cascade, so EOS is still sent to wake and drain them.
+      def shutdown(feeder, out_port, head_groups)
         feeder.kill
         feeder.join
+        out_port.close
         head_groups.each { |group| group.each { |port| port << EOS rescue nil } }
       end
     end
@@ -299,6 +305,8 @@ class Ractor
               when :flat_pipe
                 job.call(msg).each { |obj| emit.call(obj) }
               end
+            rescue Ractor::ClosedError
+              raise
             rescue Exception => e
               emit.call(Failure.new(e))
             end
@@ -307,6 +315,11 @@ class Ractor
 
         # All upstream producers finished; propagate EOS downstream.
         down_groups.each { |group| group.each { |port| port << EOS rescue nil } }
+      rescue Ractor::ClosedError
+        # A downstream port is closed: the stream was cancelled (the
+        # terminal operation closed its out_port, like SIGPIPE in a shell
+        # pipeline). Exit without draining the backlog; our own ports
+        # close with this Ractor, so the closure cascades upstream.
       end
     end
 

@@ -2,6 +2,11 @@
 
 require "test_helper"
 
+# Compute-based delay, callable from worker Ractors (top-level method).
+# Not Kernel#sleep: sub-ms sleep inside a Ractor is unreliable (Ruby 4.0.x
+# returns early from it).
+def busy_wait(n) = (i = 0; i += 1 while i < n; i)
+
 class Ractor::PipelineTest < Test::Unit::TestCase
   include Ractor::Pipeline
 
@@ -73,6 +78,20 @@ class Ractor::PipelineTest < Test::Unit::TestCase
     assert_equal [1, 4, 9], stream(1..).pipe{ it * it }.first(3)
     assert_equal 1, stream(1..).pipe{ it }.first
     assert_equal [], stream(1..).pipe{ it }.first(0)
+  end
+
+  PROBE = Ractor::Port.new
+
+  test "cancellation stops workers without draining the backlog" do
+    stream(1..20_000).
+      pipe{ it }.                                    # fast stage builds up a backlog
+      pipe{ PROBE << it; busy_wait(30_000); it }.    # slow stage reports what it processed
+      first(2)
+    sleep 0.2 # without cancellation the slow stage would drain ~600 more elements here
+    PROBE << :end_marker
+    processed = 0
+    processed += 1 until PROBE.receive == :end_marker
+    assert_operator processed, :<, 100
   end
 
   test "tee broadcasts to every branch" do
