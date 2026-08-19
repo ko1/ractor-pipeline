@@ -291,10 +291,16 @@ stream(File.foreach(name), batch: 1000).
   count
 ```
 
-More runnable samples: [examples/demo.rb](examples/demo.rb) (feature tour),
-[examples/perf.rb](examples/perf.rb) and
-[examples/readme_bench.rb](examples/readme_bench.rb) (the measurements
-below).
+Runnable examples and benchmarks, from feature tour to application level:
+
+| file | what it is |
+|---|---|
+| [examples/demo.rb](examples/demo.rb) | feature tour of the whole DSL |
+| [examples/logreport.rb](examples/logreport.rb) | end-to-end sample app: access-log report from a ~27MB file on disk |
+| [examples/logstats.rb](examples/logstats.rb) | JSONL aggregation styles (per-record vs chunk-aggregate) |
+| [examples/perf.rb](examples/perf.rb) | workload benchmarks: scaling, load balancing, granularity |
+| [examples/vs_parallel.rb](examples/vs_parallel.rb) | comparison with the parallel gem |
+| [examples/readme_bench.rb](examples/readme_bench.rb) | the numbers quoted in [Measured performance](#measured-performance) |
 
 ## Semantics notes
 
@@ -362,6 +368,15 @@ the source's `each` is invoked tens to a few hundred times (it tracks
 what the workers actually consume before the cancellation lands). A
 push-fed pipeline reads hundreds of thousands of elements in the same
 window.
+
+**End-to-end sample application** — `examples/logreport.rb`, an
+access-log report over a ~27MB / 400k-line JSONL file on disk, timed
+including file I/O and report aggregation:
+
+| implementation | wall time | |
+|---|---|---|
+| serial | 1.19s | |
+| pipeline | 0.58s | x2.06 (2000-line chunks, `lanes: 8`, disk reads overlap parsing) |
 
 ## vs the parallel gem
 
