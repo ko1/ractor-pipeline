@@ -237,9 +237,10 @@ shell pipeline). Safe to use with an infinite `stream(1..)`.
   block cannot swallow it; it also works from deep inside helper
   methods.
 
-  To collect diagnostics, wire your own stderr: a `Ractor::Port` is
-  shareable, so a stage block can capture one and report failures to the
-  caller out-of-band.
+  For human-readable diagnostics, just `warn` — worker Ractors can write
+  to STDERR directly. To collect failures *as data*, wire your own
+  channel: a `Ractor::Port` is shareable, so a stage block can capture
+  one and report to the caller out-of-band.
 
   ```ruby
   errors = Ractor::Port.new
