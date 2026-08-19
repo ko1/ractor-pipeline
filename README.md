@@ -1,5 +1,7 @@
 # Ractor::Pipeline
 
+[![CI](https://github.com/ko1/ractor-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/ko1/ractor-pipeline/actions/workflows/ci.yml)
+
 A DSL to build stream processing pipelines with Ractors. The basic model is
 close to a Unix shell pipeline: `stream` produces an input stream, each
 `pipe`/`filter_pipe` stage is a persistent Ractor connected by
