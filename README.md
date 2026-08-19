@@ -414,6 +414,40 @@ above, parallel 2.1.0):
   full process isolation and compatibility with any Ruby object without
   shareability rules.
 
+## Vocabulary map
+
+How this DSL's vocabulary corresponds to other streaming and parallel
+processing systems — including concepts this DSL deliberately does not
+(yet) provide, marked with `—` in its column.
+
+| concept | Ractor::Pipeline | Unix pipes | Python `mp.Pool` | ReactiveX | Akka Streams | Flink / Beam | Elixir Flow |
+|---|---|---|---|---|---|---|---|
+| source | `stream(src)` | stdin | iterable | `Observable` | `Source` | `DataStream` / `PCollection` | `Flow.from_enumerable` |
+| transform stage | `pipe` | a command | func | `map` | `map` / `via` | `map` / `ParDo` | `Flow.map` |
+| filter stage | `filter_pipe` | `grep` | — | `filter` | `filter` | `filter` | `Flow.filter` |
+| 1 -> N outputs | `flat_pipe` | — | — | `flatMap` | `mapConcat` | `flatMap` | `Flow.flat_map` |
+| workers per stage | `lanes:` | — | `processes:` | (Scheduler) | `mapAsync(parallelism)` | `setParallelism` | `stages:` |
+| message batching | `batch:` | pipe buffer | `chunksize` | `buffer(n)` | `grouped(n)` | bundles (automatic) | `max_demand` |
+| demand / backpressure | CREDIT tokens (pull) | blocking pipe buffer | — | — (push) | `request(n)` (Reactive Streams) | credit-based flow control | GenStage demand |
+| unordered parallelism | `lanes:` > 1 (default) | — | `imap_unordered` | `flatMap` merge | `mapAsyncUnordered` | `rebalance` | default |
+| broadcast | `tee` | `tee(1)` | — | `publish` / `share` | `Broadcast` | side outputs / broadcast | — |
+| end of stream | in-band EOS message | EOF | — | `onComplete` | completion | watermarks (generalized) | `:done` |
+| cancellation | port close cascade + cancel | SIGPIPE | `terminate` | `dispose` | `KillSwitch` | job cancel | `GenStage.cancel` |
+| drop element on error | `raise SKIP` | — | — | `onErrorResumeNext` | `Supervision.Resume` | dead letters | — |
+| run for side effects | `join` | `> /dev/null` | — | `subscribe` | `Sink.ignore` | — | `Flow.run` |
+| key partitioning | — | — | — | `groupBy` | `partition` | `keyBy` / `GroupByKey` | `Flow.partition(key:)` |
+| per-key state | — | — | — | `scan` | `statefulMapConcat` | keyed state / `aggregate` | `Flow.reduce` |
+| time windows | — | — | — | `window` | `groupedWithin` | event-time windows | `Flow.window` |
+| merge sources | — | — | — | `merge` | `Merge` | `union` | multiple producers |
+| async start handle | — (`join` is sync) | `&` | `apply_async` | (async by nature) | materialized values | job submission | `Flow.start_link` |
+
+The empty cells in this DSL's column are deliberate: key partitioning
+with per-key state (the foundation of stateful stream processing) and
+time windows are waiting for concrete use cases before they earn
+vocabulary, and execution is synchronous-only for now — the same
+split Elixir makes between `Flow.run` and `Flow.start_link` can be
+added later without changing any existing vocabulary.
+
 ## License
 
 MIT. See [LICENSE.txt](LICENSE.txt).
