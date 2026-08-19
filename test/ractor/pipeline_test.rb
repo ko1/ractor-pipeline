@@ -136,6 +136,19 @@ class Ractor::PipelineTest < Test::Unit::TestCase
     assert_equal 50, stream(1..100).filter_pipe(lanes: 2){ it.odd? }.count
   end
 
+  DRAIN_PROBE = Ractor::Port.new
+
+  test "join runs the pipeline for side effects and returns self" do
+    pl = stream(1..10).pipe(lanes: 2){ DRAIN_PROBE << it }
+    assert_same pl, pl.join
+    DRAIN_PROBE << :end_marker
+    seen = []
+    until (v = DRAIN_PROBE.receive) == :end_marker
+      seen << v
+    end
+    assert_equal (1..10).to_a, seen.sort
+  end
+
   test "each yields every element and returns self" do
     seen = []
     pl = stream(1..5).pipe{ it + 1 }

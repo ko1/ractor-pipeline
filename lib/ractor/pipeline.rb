@@ -32,8 +32,9 @@ require_relative "pipeline/version"
 #     pipeline.
 #   * tee broadcasts each element to every branch; branch outputs are
 #     merged (unordered) into one downstream stream.
-#   * reduce/each/to_a/count/first are terminal operations executed in the
-#     caller Ractor.
+#   * reduce/each/to_a/count/first/join are terminal operations executed
+#     in the caller Ractor (join runs the pipeline purely for its side
+#     effects, discarding output).
 #
 # Semantics notes:
 #   * Ordering: a chain of lanes: 1 stages preserves input order (also
@@ -176,6 +177,14 @@ class Ractor
         n = 0
         run { n += 1 }
         n
+      end
+
+      # Runs the pipeline for its side effects, discarding all output, and
+      # returns self when the stream is fully processed -- like
+      # Thread#join, but for a pipeline (conceptually `> /dev/null`).
+      def join
+        run { }
+        self
       end
 
       # Terminates the pipeline as soon as enough elements are received.

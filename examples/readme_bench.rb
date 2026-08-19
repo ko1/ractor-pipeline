@@ -17,7 +17,7 @@ LANES = [2, 4, 8, 16].freeze
 def fib(n) = n < 2 ? n : fib(n - 1) + fib(n - 2)
 def busy(n) = (i = 0; i += 1 while i < n; i)
 
-def best(times = 5)
+def best(times = (ENV["BEST"] || 5).to_i)
   times.times.map { t = Time.now; yield; Time.now - t }.min
 end
 
@@ -71,7 +71,7 @@ rows << ["fib(28) x 32 (uniform)", base, speedups]
 jobs = [40_000_000] + [4_000_000] * 31
 base = best{ jobs.each{ busy(it) } }
 speedups = LANES.map do |n|
-  dt = best{ stream(jobs).pipe(lanes: n){ busy(it) }.each{} }
+  dt = best{ stream(jobs).pipe(lanes: n){ busy(it) }.join }
   base / dt
 end
 rows << ["skewed load (1 heavy + 31 light)", base, speedups]

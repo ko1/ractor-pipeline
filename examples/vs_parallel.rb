@@ -60,7 +60,7 @@ section.call "skewed load: 1 heavy (~0.3s) + 31 light (~30ms)"
 jobs = [40_000_000] + [4_000_000] * 31
 base = best{ jobs.each{ busy(it) } }
 printf "  %-32s %8.3fs\n", "serial", base
-dt = best{ stream(jobs).pipe(lanes: 4){ busy(it) }.each{} }
+dt = best{ stream(jobs).pipe(lanes: 4){ busy(it) }.join }
 row "Ractor::Pipeline lanes: 4", base, dt
 dt = best{ Parallel.each(jobs, in_processes: 4){ busy(it) } }
 row "Parallel in_processes: 4", base, dt

@@ -176,7 +176,7 @@ section "load balancing: one heavy element among light ones (lanes: 4)" do
   _, base = bench{ jobs.each{ busy(it) } }
   report "serial", base
 
-  _, dt = bench{ stream(jobs).pipe(lanes: 4){ busy(it) }.each{} }
+  _, dt = bench{ stream(jobs).pipe(lanes: 4){ busy(it) }.join }
   report "pipe(lanes: 4)", dt, base
 end
 

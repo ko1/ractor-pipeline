@@ -52,7 +52,7 @@ is experimental, and so is this library.
 | `.filter_pipe{ pred(it) }` | `filter` | 1 Ractor (sends the original element) |
 | `.flat_pipe{ enum }` | `flat_map` | 1 input -> N outputs |
 | `.tee(pipe{}, pipe{})` | — | broadcast to branches, merged output |
-| `.reduce(init){}` `.each{}` `.to_a` `.count` `.first(n)` | same | terminal, runs in the caller, no Ractor |
+| `.reduce(init){}` `.each{}` `.to_a` `.count` `.first(n)` `.join` | same | terminal, runs in the caller, no Ractor |
 
 ## API guide
 
@@ -178,7 +178,12 @@ pl.to_a                                # collects into an Array
 pl.count                               # number of output elements
 pl.first                               # first element (stops the pipeline)
 pl.first(n)                            # first n elements as an Array
+pl.join                                # run for side effects, discard output
 ```
+
+`join` is the pipe-through no-op terminal (conceptually `> /dev/null`):
+it runs the pipeline to completion for the stage blocks' side effects and
+returns self, like Thread#join.
 
 `first` cancels the rest of the stream: it stops the feeder, closes its
 output port, and broadcasts a cancel message, so workers drop their
